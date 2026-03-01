@@ -37,6 +37,13 @@ trainPayload = struct();
 trainPayload.X = XTrain;
 trainPayload.y = yTrain;
 
+% Optional: select which models to train (default: ["rf","et","hgb"]).
+% Supported model keys: "rf", "et", "hgb", "svm", "cnn", "transformer", "rl", "gnn"
+% Examples:
+%   trainPayload.models = ["rf", "svm"];             % sklearn only
+%   trainPayload.models = ["rf", "cnn", "transformer"]; % mix sklearn + torch
+%   trainPayload.models = ["rf", "et", "hgb", "svm", "cnn", "transformer", "rl"];  % all tabular
+
 res = Train_and_predict(trainPayload, pythonExe, seed);
 chosen = string(res{"chosen"});
 

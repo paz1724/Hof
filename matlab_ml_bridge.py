@@ -10,13 +10,15 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold, GridSearchCV, train_test_split
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, HistGradientBoostingClassifier
+from sklearn.svm import SVC
 import joblib
 
 # n_jobs for GridSearchCV. Set env SKLEARN_N_JOBS=1 when calling from MATLAB
 # (MATLAB's embedded Python cannot spawn loky worker subprocesses).
 _N_JOBS = int(os.environ.get("SKLEARN_N_JOBS", "-1"))
 
-# --------- Optional GNN imports (fallback if not installed) ----------
+# --------- Optional torch / torch-geometric imports ----------
+_HAS_TORCH = False
 _HAS_TG = False
 torch = None
 nn = None
@@ -29,6 +31,7 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    _HAS_TORCH = True
     _HAS_TG = True
     try:
         from torch_geometric.data import Data  # pyright: ignore[reportMissingImports]
@@ -41,6 +44,7 @@ try:
     except Exception:
         _HAS_TG = False
 except Exception:
+    _HAS_TORCH = False
     _HAS_TG = False
 
 
@@ -82,6 +86,18 @@ def _parse_input(d: dict):
             raise ValueError(f'X and y sample mismatch. X has {X.shape[0]} rows, y has {y.shape[0]}.')
         out["X"] = X
         print(f"[parse_input] X: {X.shape[0]} samples, {X.shape[1]} features", flush=True)
+
+    # Optional: which models to train
+    _VALID_MODELS = {"rf", "et", "hgb", "svm", "cnn", "transformer", "rl", "gnn"}
+    if "models" in d:
+        models = list(d["models"])
+        # Accept Python str or bytes from MATLAB
+        models = [str(m) for m in models]
+        unknown = set(models) - _VALID_MODELS
+        if unknown:
+            raise ValueError(f"Unknown model names: {unknown}. Valid: {sorted(_VALID_MODELS)}")
+        out["models"] = models
+        print(f"[parse_input] models: {models}", flush=True)
 
     if "node_feats" in d and "edge_index" in d:
         node_feats = _to_numpy(d["node_feats"]).astype(np.float32)
@@ -142,20 +158,24 @@ def _predict_proba_binary(model, X):
     return np.asarray(p, dtype=np.float32).reshape(-1)
 
 
-def train_best_tree_model(X, y, seed=0):
+def train_sklearn_models(X, y, seed=0, model_keys=None):
     """
-    Trains a strong tree ensemble with CV and returns best estimator + cv results summary.
-    Uses only scikit-learn (no exotic deps).
+    Trains sklearn classifiers with CV and returns best estimator + cv results summary.
+    *model_keys*: list of model name strings to evaluate.
+                  Default (None) → ``["rf", "et", "hgb"]`` (original behaviour).
     """
-    # Candidates
-    candidates = [
-        ("rf", RandomForestClassifier(random_state=seed, class_weight="balanced")),
-        ("et", ExtraTreesClassifier(random_state=seed, class_weight="balanced")),
-        ("hgb", HistGradientBoostingClassifier(random_state=seed)),
-    ]
+    if model_keys is None:
+        model_keys = ["rf", "et", "hgb"]
+
+    all_candidates = {
+        "rf": lambda: RandomForestClassifier(random_state=seed, class_weight="balanced"),
+        "et": lambda: ExtraTreesClassifier(random_state=seed, class_weight="balanced"),
+        "hgb": lambda: HistGradientBoostingClassifier(random_state=seed),
+        "svm": lambda: SVC(probability=True, class_weight="balanced", random_state=seed),
+    }
 
     # Small but effective search spaces (edit as needed)
-    param_grids = {
+    all_param_grids = {
         "rf": {
             "n_estimators": [200, 500],
             "max_depth": [None, 6, 12],
@@ -174,7 +194,15 @@ def train_best_tree_model(X, y, seed=0):
             "max_iter": [200, 400],
             "l2_regularization": [0.0, 0.1],
         },
+        "svm": {
+            "C": [0.1, 1.0, 10.0],
+            "kernel": ["rbf", "linear"],
+        },
     }
+
+    candidates = [(k, all_candidates[k]()) for k in model_keys if k in all_candidates]
+    if not candidates:
+        return None, None, None
 
     cv = StratifiedKFold(n_splits=_safe_stratified_splits(y, preferred=5), shuffle=True, random_state=seed)
 
@@ -184,17 +212,17 @@ def train_best_tree_model(X, y, seed=0):
     best_cv = None
 
     for name, model in candidates:
-        print(f"[train_tree] Evaluating {name} ...", flush=True)
+        print(f"[train_sklearn] Evaluating {name} ...", flush=True)
         gs = GridSearchCV(
             model,
-            param_grid=param_grids[name],
+            param_grid=all_param_grids[name],
             scoring="f1",
             cv=cv,
             n_jobs=_N_JOBS,
             refit=True,
         )
         gs.fit(X, y)
-        print(f"[train_tree] {name} best CV f1={gs.best_score_:.4f}  params={gs.best_params_}", flush=True)
+        print(f"[train_sklearn] {name} best CV f1={gs.best_score_:.4f}  params={gs.best_params_}", flush=True)
         if gs.best_score_ > best_score:
             best_score = float(gs.best_score_)
             best = gs.best_estimator_
@@ -204,8 +232,279 @@ def train_best_tree_model(X, y, seed=0):
                 "best_params": gs.best_params_,
             }
 
-    print(f"[train_tree] Winner: {best_name} (f1={best_score:.4f})", flush=True)
+    print(f"[train_sklearn] Winner: {best_name} (f1={best_score:.4f})", flush=True)
     return best_name, best, best_cv
+
+
+# Keep old name as alias for backward compatibility
+train_best_tree_model = train_sklearn_models
+
+
+# -------------------- Torch-based tabular models --------------------
+
+def _train_val_split_torch(X, y, seed, val_frac=0.2):
+    """80/20 stratified split, returning torch tensors."""
+    idx = np.arange(len(y))
+    tr_idx, va_idx = train_test_split(idx, test_size=val_frac, stratify=y, random_state=seed)
+    Xt = torch.tensor(X[tr_idx], dtype=torch.float32)
+    yt = torch.tensor(y[tr_idx], dtype=torch.float32)
+    Xv = torch.tensor(X[va_idx], dtype=torch.float32)
+    yv = torch.tensor(y[va_idx], dtype=torch.float32)
+    return Xt, yt, Xv, yv
+
+
+# ---- 1D CNN ----
+
+if _HAS_TORCH:
+    class TabularCNN(torch.nn.Module):
+        def __init__(self, n_features: int, hidden: int = 64):
+            super().__init__()
+            self.conv1 = nn.Conv1d(1, hidden, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1)
+            self.fc = nn.Linear(hidden, 1)
+
+        def forward(self, x):
+            # x: [N, F] → [N, 1, F]
+            x = x.unsqueeze(1)
+            x = F.relu(self.conv1(x))
+            x = F.relu(self.conv2(x))
+            x = x.mean(dim=2)  # global avg pool → [N, hidden]
+            return self.fc(x).squeeze(-1)
+
+
+def train_cnn(X, y, seed=0, epochs=80, lr=1e-3):
+    if not _HAS_TORCH:
+        return None, {"enabled": False, "reason": "torch not available"}
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    Xt, yt, Xv, yv = _train_val_split_torch(X, y, seed)
+    model = TabularCNN(n_features=X.shape[1])
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    best_f1, best_state = -1.0, None
+    patience, wait = 15, 0
+    print(f"[train_cnn] Starting CNN training: {X.shape[0]} samples, {X.shape[1]} features, {epochs} epochs", flush=True)
+
+    for ep in range(epochs):
+        model.train()
+        opt.zero_grad()
+        loss = loss_fn(model(Xt), yt)
+        loss.backward()
+        opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            probs = torch.sigmoid(model(Xv)).numpy()
+        m = _metrics(yv.numpy(), probs)
+        if m["f1"] > best_f1:
+            best_f1 = m["f1"]
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_metrics = m
+            wait = 0
+        else:
+            wait += 1
+        if wait >= patience:
+            print(f"[train_cnn] Early stop at epoch {ep+1}", flush=True)
+            break
+        if (ep + 1) % 20 == 0 or ep == 0:
+            print(f"[train_cnn] Epoch {ep+1}/{epochs}  val_f1={m['f1']:.4f}  best_f1={best_f1:.4f}", flush=True)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    print(f"[train_cnn] Done. Best val metrics: {best_metrics}", flush=True)
+    return model, {"enabled": True, "val_metrics": best_metrics}
+
+
+def predict_cnn(model, X):
+    model.eval()
+    with torch.no_grad():
+        probs = torch.sigmoid(model(torch.tensor(X, dtype=torch.float32))).numpy().astype(np.float32)
+    return probs
+
+
+# ---- Transformer ----
+
+if _HAS_TORCH:
+    class TabularTransformer(torch.nn.Module):
+        def __init__(self, n_features: int, d_model: int = 64, nhead: int = 4, num_layers: int = 2):
+            super().__init__()
+            self.feature_embed = nn.Linear(1, d_model)
+            self.pos_embed = nn.Parameter(torch.randn(1, n_features, d_model) * 0.02)
+            encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.fc = nn.Linear(d_model, 1)
+
+        def forward(self, x):
+            # x: [N, F] → [N, F, 1] → embed → [N, F, d_model]
+            x = self.feature_embed(x.unsqueeze(-1)) + self.pos_embed
+            x = self.encoder(x)
+            x = x.mean(dim=1)  # mean pool over features
+            return self.fc(x).squeeze(-1)
+
+
+def train_transformer(X, y, seed=0, epochs=80, lr=1e-3):
+    if not _HAS_TORCH:
+        return None, {"enabled": False, "reason": "torch not available"}
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    Xt, yt, Xv, yv = _train_val_split_torch(X, y, seed)
+    model = TabularTransformer(n_features=X.shape[1])
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    best_f1, best_state = -1.0, None
+    patience, wait = 15, 0
+    print(f"[train_transformer] Starting Transformer training: {X.shape[0]} samples, {X.shape[1]} features, {epochs} epochs", flush=True)
+
+    for ep in range(epochs):
+        model.train()
+        opt.zero_grad()
+        loss = loss_fn(model(Xt), yt)
+        loss.backward()
+        opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            probs = torch.sigmoid(model(Xv)).numpy()
+        m = _metrics(yv.numpy(), probs)
+        if m["f1"] > best_f1:
+            best_f1 = m["f1"]
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_metrics = m
+            wait = 0
+        else:
+            wait += 1
+        if wait >= patience:
+            print(f"[train_transformer] Early stop at epoch {ep+1}", flush=True)
+            break
+        if (ep + 1) % 20 == 0 or ep == 0:
+            print(f"[train_transformer] Epoch {ep+1}/{epochs}  val_f1={m['f1']:.4f}  best_f1={best_f1:.4f}", flush=True)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    print(f"[train_transformer] Done. Best val metrics: {best_metrics}", flush=True)
+    return model, {"enabled": True, "val_metrics": best_metrics}
+
+
+def predict_transformer(model, X):
+    model.eval()
+    with torch.no_grad():
+        probs = torch.sigmoid(model(torch.tensor(X, dtype=torch.float32))).numpy().astype(np.float32)
+    return probs
+
+
+# ---- RL DQN Classifier ----
+
+if _HAS_TORCH:
+    class DQNClassifier(torch.nn.Module):
+        def __init__(self, n_features: int, hidden: int = 64):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(n_features, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, 2),  # Q-values for actions {0, 1}
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+
+def train_rl(X, y, seed=0, episodes=5, lr=1e-3):
+    """Train a DQN-style classifier via experience replay."""
+    if not _HAS_TORCH:
+        return None, {"enabled": False, "reason": "torch not available"}
+
+    torch.manual_seed(seed)
+    rng = np.random.RandomState(seed)
+
+    n_features = X.shape[1]
+    model = DQNClassifier(n_features)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    # Experience replay buffer
+    buffer_X = []
+    buffer_action = []
+    buffer_reward = []
+    batch_size = min(64, X.shape[0])
+
+    # Split for validation
+    idx = np.arange(len(y))
+    tr_idx, va_idx = train_test_split(idx, test_size=0.2, stratify=y, random_state=seed)
+    X_tr, y_tr = X[tr_idx], y[tr_idx]
+    X_va, y_va = X[va_idx], y[va_idx]
+
+    eps_start, eps_end = 1.0, 0.05
+    total_steps = episodes * len(X_tr)
+
+    best_f1, best_state, best_metrics = -1.0, None, None
+    step = 0
+    print(f"[train_rl] Starting RL DQN training: {X.shape[0]} samples, {episodes} episodes", flush=True)
+
+    for ep in range(episodes):
+        order = rng.permutation(len(X_tr))
+        for i in order:
+            state = torch.tensor(X_tr[i], dtype=torch.float32).unsqueeze(0)
+            eps = eps_start - (eps_start - eps_end) * min(step / max(total_steps - 1, 1), 1.0)
+            step += 1
+
+            # Epsilon-greedy action
+            if rng.rand() < eps:
+                action = rng.randint(2)
+            else:
+                model.eval()
+                with torch.no_grad():
+                    action = int(model(state).argmax(dim=1).item())
+
+            reward = 1.0 if action == int(y_tr[i]) else -1.0
+            buffer_X.append(X_tr[i])
+            buffer_action.append(action)
+            buffer_reward.append(reward)
+
+            # Train from replay buffer
+            if len(buffer_X) >= batch_size:
+                idxs = rng.choice(len(buffer_X), size=batch_size, replace=False)
+                bx = torch.tensor(np.array([buffer_X[j] for j in idxs]), dtype=torch.float32)
+                ba = torch.tensor([buffer_action[j] for j in idxs], dtype=torch.long)
+                br = torch.tensor([buffer_reward[j] for j in idxs], dtype=torch.float32)
+
+                model.train()
+                q_all = model(bx)
+                q_selected = q_all.gather(1, ba.unsqueeze(1)).squeeze(1)
+                opt.zero_grad()
+                loss = loss_fn(q_selected, br)
+                loss.backward()
+                opt.step()
+
+        # Validation after each episode
+        model.eval()
+        with torch.no_grad():
+            q = model(torch.tensor(X_va, dtype=torch.float32))
+            probs = torch.softmax(q, dim=1)[:, 1].numpy()
+        m = _metrics(y_va, probs)
+        if m["f1"] > best_f1:
+            best_f1 = m["f1"]
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_metrics = m
+        print(f"[train_rl] Episode {ep+1}/{episodes}  val_f1={m['f1']:.4f}  best_f1={best_f1:.4f}", flush=True)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    print(f"[train_rl] Done. Best val metrics: {best_metrics}", flush=True)
+    return model, {"enabled": True, "val_metrics": best_metrics}
+
+
+def predict_rl(model, X):
+    model.eval()
+    with torch.no_grad():
+        q = model(torch.tensor(X, dtype=torch.float32))
+        probs = torch.softmax(q, dim=1)[:, 1].numpy().astype(np.float32)
+    return probs
 
 
 # ------------------------ GNN (optional) ------------------------
@@ -341,9 +640,10 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
 
     Returns a plain Python dict (MATLAB will receive a py.dict):
       {
-        "tree": {...},
-        "gnn": {...} (if possible),
-        "chosen": "tree" or "gnn",
+        "tree": {...},               # sklearn winner (if any sklearn models requested)
+        "cnn"|"transformer"|"rl": {},# torch model results
+        "gnn": {...},                # if graph data + "gnn" requested
+        "chosen": "<best model key>",
         "y_prob": [...],
         "metrics": {...}
       }
@@ -353,12 +653,20 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
 
     parsed = _parse_input(matlab_dict)
     y = parsed["y"]
+    models = parsed.get("models", ["rf", "et", "hgb"])  # default preserves old behaviour
 
     results = {}
 
-    # ---- Tree model (tabular) ----
-    if "X" in parsed:
-        print(f"[bridge] Training tree model ...", flush=True)
+    _SKLEARN_KEYS = {"rf", "et", "hgb", "svm"}
+    _TORCH_TABULAR_KEYS = {"cnn", "transformer", "rl"}
+
+    sklearn_keys = [m for m in models if m in _SKLEARN_KEYS]
+    torch_keys = [m for m in models if m in _TORCH_TABULAR_KEYS]
+    want_gnn = "gnn" in models
+
+    # ---- sklearn models (tabular) ----
+    if "X" in parsed and sklearn_keys:
+        print(f"[bridge] Training sklearn models {sklearn_keys} ...", flush=True)
         X = parsed["X"]
         _, class_counts = np.unique(y, return_counts=True)
         can_holdout = class_counts.min() >= 2 and X.shape[0] >= 10
@@ -373,41 +681,75 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
             X_tr, y_tr = X[tr_idx], y[tr_idx]
             X_va, y_va = X[va_idx], y[va_idx]
 
-            name, tree, tree_cv = train_best_tree_model(X_tr, y_tr, seed=seed)
-            y_prob_val = _predict_proba_binary(tree, X_va)
-            tree_select_metrics = _metrics(y_va, y_prob_val)
+            name, tree, tree_cv = train_sklearn_models(X_tr, y_tr, seed=seed, model_keys=sklearn_keys)
+            if tree is not None:
+                y_prob_val = _predict_proba_binary(tree, X_va)
+                tree_select_metrics = _metrics(y_va, y_prob_val)
+            else:
+                name, tree, tree_cv = None, None, None
+                tree_select_metrics = None
         else:
-            # Small datasets may not support a stable stratified holdout split.
-            name, tree, tree_cv = train_best_tree_model(X, y, seed=seed)
-            y_prob_val = _predict_proba_binary(tree, X)
-            tree_select_metrics = _metrics(y, y_prob_val)
+            name, tree, tree_cv = train_sklearn_models(X, y, seed=seed, model_keys=sklearn_keys)
+            if tree is not None:
+                y_prob_val = _predict_proba_binary(tree, X)
+                tree_select_metrics = _metrics(y, y_prob_val)
+            else:
+                tree_select_metrics = None
 
-        # Refit on all data for final model and exported probabilities.
-        tree.fit(X, y)
-        y_prob_tree = _predict_proba_binary(tree, X)
+        if tree is not None:
+            # Refit on all data for final model and exported probabilities.
+            tree.fit(X, y)
+            y_prob_tree = _predict_proba_binary(tree, X)
 
-        tree_path = os.path.join(save_dir, f"best_tree_{name}.joblib")
-        joblib.dump(tree, tree_path)
-        print(f"[bridge] Tree model saved: {tree_path}", flush=True)
+            tree_path = os.path.join(save_dir, f"best_tree_{name}.joblib")
+            joblib.dump(tree, tree_path)
+            print(f"[bridge] sklearn model saved: {tree_path}", flush=True)
 
-        results["tree"] = {
-            "model": name,
-            "cv": tree_cv,
-            "path": tree_path,
-            "metrics_select": tree_select_metrics,
-            "metrics_train": _metrics(y, y_prob_tree),
+            results["tree"] = {
+                "model": name,
+                "cv": tree_cv,
+                "path": tree_path,
+                "metrics_select": tree_select_metrics,
+                "metrics_train": _metrics(y, y_prob_tree),
+                "y_prob": y_prob_tree.tolist(),
+            }
+
+    # ---- Torch tabular models ----
+    if "X" in parsed and torch_keys:
+        X = parsed["X"]
+        torch_trainers = {
+            "cnn": (train_cnn, predict_cnn, TabularCNN if _HAS_TORCH else None),
+            "transformer": (train_transformer, predict_transformer, TabularTransformer if _HAS_TORCH else None),
+            "rl": (train_rl, predict_rl, DQNClassifier if _HAS_TORCH else None),
         }
-        results["tree"]["y_prob"] = y_prob_tree.tolist()
+        for tk in torch_keys:
+            train_fn, pred_fn, model_cls = torch_trainers[tk]
+            print(f"[bridge] Training {tk} model ...", flush=True)
+            model, info = train_fn(X, y, seed=seed)
+            if model is not None:
+                y_prob_torch = pred_fn(model, X)
+                pt_path = os.path.join(save_dir, f"{tk}_state.pt")
+                torch.save(model.state_dict(), pt_path)
+                print(f"[bridge] {tk} model saved: {pt_path}", flush=True)
+                results[tk] = {
+                    "enabled": True,
+                    "path": pt_path,
+                    "train_info": info,
+                    "metrics_select": info.get("val_metrics"),
+                    "metrics_train": _metrics(y, y_prob_torch),
+                    "y_prob": y_prob_torch.tolist(),
+                }
+            else:
+                results[tk] = info
 
     # ---- GNN model (graph per sample) ----
-    if "node_feats" in parsed and "edge_index" in parsed:
+    if want_gnn and "node_feats" in parsed and "edge_index" in parsed:
         print(f"[bridge] Training GNN model ...", flush=True)
         if _HAS_TG:
             model, info = train_gnn(parsed["node_feats"], parsed["edge_index"], y, seed=seed)
             if model is not None:
                 y_prob_gnn = predict_gnn(model, parsed["node_feats"], parsed["edge_index"])
                 gnn_path = os.path.join(save_dir, "gnn_state.pt")
-                import torch
                 torch.save(model.state_dict(), gnn_path)
 
                 results["gnn"] = {
@@ -416,27 +758,25 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
                     "train_info": info,
                     "metrics_select": info.get("val_metrics"),
                     "metrics_train": _metrics(y, y_prob_gnn),
+                    "y_prob": y_prob_gnn.tolist(),
                 }
-                results["gnn"]["y_prob"] = y_prob_gnn.tolist()
             else:
                 results["gnn"] = info
         else:
             results["gnn"] = {"enabled": False, "reason": "torch/torch_geometric not available"}
 
-    # ---- Choose model by F1 on train (replace with proper held-out if you want) ----
-    chosen = None
-    y_prob = None
-    chosen_metrics = None
-
+    # ---- Choose best model by selection F1 ----
     cand = []
     if "tree" in results and "metrics_select" in results["tree"]:
         cand.append(("tree", results["tree"]["metrics_select"]["f1"], results["tree"]["y_prob"], results["tree"]["metrics_select"]))
-    if (
-        "gnn" in results
-        and results["gnn"].get("enabled", False)
-        and results["gnn"].get("metrics_select") is not None
-    ):
-        cand.append(("gnn", results["gnn"]["metrics_select"]["f1"], results["gnn"]["y_prob"], results["gnn"]["metrics_select"]))
+
+    for tk in list(_TORCH_TABULAR_KEYS) + ["gnn"]:
+        if (
+            tk in results
+            and results[tk].get("enabled", False)
+            and results[tk].get("metrics_select") is not None
+        ):
+            cand.append((tk, results[tk]["metrics_select"]["f1"], results[tk]["y_prob"], results[tk]["metrics_select"]))
 
     if len(cand) == 0:
         raise ValueError("No model could be trained. Provide X and/or (node_feats, edge_index) with valid binary y.")

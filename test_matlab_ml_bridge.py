@@ -311,3 +311,153 @@ class TestTrainGNNFallback:
         )
         assert model is None
         assert info["enabled"] is False
+
+
+# ===================================================================
+# 10. Model selection via "models" field
+# ===================================================================
+
+class TestModelSelection:
+    def test_parse_input_models_field(self):
+        d = _make_tabular(n=20, f=3)
+        d["models"] = ["rf", "svm"]
+        out = mb._parse_input(d)
+        assert out["models"] == ["rf", "svm"]
+
+    def test_parse_input_invalid_model_raises(self):
+        d = _make_tabular(n=20, f=3)
+        d["models"] = ["rf", "bogus"]
+        with pytest.raises(ValueError, match="Unknown model names"):
+            mb._parse_input(d)
+
+    def test_default_models_backward_compat(self, tmp_path):
+        """No models field → trains rf/et/hgb (old behaviour)."""
+        d = _make_tabular(n=60, f=4, seed=99)
+        save_dir = str(tmp_path / "compat")
+        result = mb.train_predict_save(d, save_dir, seed=99)
+        assert "tree" in result
+        assert result["tree"]["model"] in ("rf", "et", "hgb")
+
+    def test_select_only_svm(self, tmp_path):
+        d = _make_tabular(n=60, f=4, seed=99)
+        d["models"] = ["svm"]
+        save_dir = str(tmp_path / "svm_only")
+        result = mb.train_predict_save(d, save_dir, seed=99)
+        assert "tree" in result
+        assert result["tree"]["model"] == "svm"
+
+
+# ===================================================================
+# 11. SVM via train_sklearn_models
+# ===================================================================
+
+class TestSVM:
+    def test_svm_via_sklearn_models(self):
+        d = _make_tabular(n=60, f=4, seed=7)
+        X = np.array(d["X"], dtype=np.float32)
+        y = np.array(d["y"], dtype=np.int64)
+        name, model, cv = mb.train_sklearn_models(X, y, seed=7, model_keys=["svm"])
+        assert name == "svm"
+        assert hasattr(model, "predict_proba")
+        p = mb._predict_proba_binary(model, X)
+        assert p.shape == (60,)
+
+
+# ===================================================================
+# 12. CNN (conditional on torch)
+# ===================================================================
+
+@pytest.mark.skipif(not mb._HAS_TORCH, reason="torch not installed")
+class TestCNN:
+    def test_train_and_predict(self):
+        d = _make_tabular(n=60, f=4, seed=0)
+        X = np.array(d["X"], dtype=np.float32)
+        y = np.array(d["y"], dtype=np.int64)
+        model, info = mb.train_cnn(X, y, seed=0, epochs=5)
+        assert model is not None
+        assert info["enabled"] is True
+        probs = mb.predict_cnn(model, X)
+        assert probs.shape == (60,)
+        assert np.all((probs >= 0) & (probs <= 1))
+
+    def test_end_to_end(self, tmp_path):
+        d = _make_tabular(n=60, f=4, seed=0)
+        d["models"] = ["cnn"]
+        save_dir = str(tmp_path / "cnn_e2e")
+        result = mb.train_predict_save(d, save_dir, seed=0)
+        assert "cnn" in result
+        assert result["cnn"]["enabled"] is True
+        assert os.path.isfile(os.path.join(save_dir, "cnn_state.pt"))
+
+
+# ===================================================================
+# 13. Transformer (conditional on torch)
+# ===================================================================
+
+@pytest.mark.skipif(not mb._HAS_TORCH, reason="torch not installed")
+class TestTransformer:
+    def test_train_and_predict(self):
+        d = _make_tabular(n=60, f=4, seed=0)
+        X = np.array(d["X"], dtype=np.float32)
+        y = np.array(d["y"], dtype=np.int64)
+        model, info = mb.train_transformer(X, y, seed=0, epochs=5)
+        assert model is not None
+        assert info["enabled"] is True
+        probs = mb.predict_transformer(model, X)
+        assert probs.shape == (60,)
+        assert np.all((probs >= 0) & (probs <= 1))
+
+    def test_end_to_end(self, tmp_path):
+        d = _make_tabular(n=60, f=4, seed=0)
+        d["models"] = ["transformer"]
+        save_dir = str(tmp_path / "transformer_e2e")
+        result = mb.train_predict_save(d, save_dir, seed=0)
+        assert "transformer" in result
+        assert result["transformer"]["enabled"] is True
+        assert os.path.isfile(os.path.join(save_dir, "transformer_state.pt"))
+
+
+# ===================================================================
+# 14. RL DQN (conditional on torch)
+# ===================================================================
+
+@pytest.mark.skipif(not mb._HAS_TORCH, reason="torch not installed")
+class TestRL:
+    def test_train_and_predict(self):
+        d = _make_tabular(n=60, f=4, seed=0)
+        X = np.array(d["X"], dtype=np.float32)
+        y = np.array(d["y"], dtype=np.int64)
+        model, info = mb.train_rl(X, y, seed=0, episodes=2)
+        assert model is not None
+        assert info["enabled"] is True
+        probs = mb.predict_rl(model, X)
+        assert probs.shape == (60,)
+        assert np.all((probs >= 0) & (probs <= 1))
+
+    def test_end_to_end(self, tmp_path):
+        d = _make_tabular(n=60, f=4, seed=0)
+        d["models"] = ["rl"]
+        save_dir = str(tmp_path / "rl_e2e")
+        result = mb.train_predict_save(d, save_dir, seed=0)
+        assert "rl" in result
+        assert result["rl"]["enabled"] is True
+        assert os.path.isfile(os.path.join(save_dir, "rl_state.pt"))
+
+
+# ===================================================================
+# 15. Mixed model selection
+# ===================================================================
+
+class TestMixedModels:
+    def test_sklearn_plus_torch(self, tmp_path):
+        """Train a mix of sklearn and torch models, check winner is selected."""
+        d = _make_tabular(n=80, f=4, seed=42)
+        models = ["rf", "svm"]
+        if mb._HAS_TORCH:
+            models.append("cnn")
+        d["models"] = models
+        save_dir = str(tmp_path / "mixed")
+        result = mb.train_predict_save(d, save_dir, seed=42)
+        assert "chosen" in result
+        assert "y_prob" in result
+        assert "metrics" in result

@@ -91,8 +91,19 @@ function out = matlab2py(v)
         out = struct2pydict(v);
     elseif isnumeric(v) || islogical(v)
         out = py.numpy.array(v);  % requires numpy installed in that Python
-    elseif ischar(v) || isstring(v)
-        out = char(v);
+    elseif ischar(v)
+        out = py.str(v);
+    elseif isstring(v)
+        if isscalar(v)
+            out = py.str(char(v));
+        else
+            % String array → Python list of strings
+            L = py.list;
+            for i = 1:numel(v)
+                L.append(py.str(char(v(i))));
+            end
+            out = L;
+        end
     elseif iscell(v)
         % Convert cell to python list
         L = py.list;
