@@ -28,6 +28,20 @@ DataLoader = None
 GCNConv = None
 global_mean_pool = None
 try:
+    # On Windows, MATLAB's embedded Python may fail to load PyTorch DLLs
+    # unless we explicitly register torch's DLL directory first.
+    if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        import importlib.util as _ilu
+        _torch_spec = _ilu.find_spec("torch")
+        if _torch_spec is not None and _torch_spec.origin is not None:
+            _torch_lib = os.path.join(os.path.dirname(_torch_spec.origin), "lib")
+            if os.path.isdir(_torch_lib):
+                os.add_dll_directory(_torch_lib)
+            # Also register the torch bin directory (contains some DLLs on newer versions)
+            _torch_bin = os.path.join(os.path.dirname(_torch_spec.origin), "bin")
+            if os.path.isdir(_torch_bin):
+                os.add_dll_directory(_torch_bin)
+
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -46,6 +60,15 @@ try:
 except Exception:
     _HAS_TORCH = False
     _HAS_TG = False
+
+# When torch is unavailable in-process (e.g. MATLAB DLL conflict),
+# store the real Python path so we can fall back to subprocess execution.
+import sys as _sys
+_REAL_PYTHON = None
+if not _HAS_TORCH:
+    _candidate = os.path.join(_sys.prefix, "python.exe" if os.name == "nt" else "python")
+    if os.path.isfile(_candidate):
+        _REAL_PYTHON = _candidate
 
 
 def _to_numpy(x):
@@ -90,9 +113,13 @@ def _parse_input(d: dict):
     # Optional: which models to train
     _VALID_MODELS = {"rf", "et", "hgb", "svm", "cnn", "transformer", "rl", "gnn"}
     if "models" in d:
-        models = list(d["models"])
-        # Accept Python str or bytes from MATLAB
-        models = [str(m) for m in models]
+        raw = d["models"]
+        # A single string (e.g. from MATLAB scalar string) must not be
+        # iterated character-by-character; wrap it in a list first.
+        if isinstance(raw, str):
+            models = [raw]
+        else:
+            models = [str(m) for m in raw]
         unknown = set(models) - _VALID_MODELS
         if unknown:
             raise ValueError(f"Unknown model names: {unknown}. Valid: {sorted(_VALID_MODELS)}")
@@ -507,6 +534,91 @@ def predict_rl(model, X):
     return probs
 
 
+# ----------- Subprocess fallback for torch models in MATLAB -----------
+
+def _run_torch_subprocess(model_key, X, y, seed, save_dir):
+    """
+    Train a torch model in a subprocess when in-process torch is unavailable
+    (e.g. DLL conflict in MATLAB's embedded Python).
+    Returns (info_dict, y_prob_list) or (disabled_dict, None).
+    """
+    if _REAL_PYTHON is None:
+        return {"enabled": False, "reason": "torch not available and no external Python found"}, None
+
+    import subprocess, tempfile
+    # Save data to temp files
+    data_path = os.path.join(save_dir, f"_tmp_{model_key}_data.npz")
+    np.savez(data_path, X=X, y=y)
+
+    script = f"""
+import sys, os, json
+sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
+os.environ.setdefault('SKLEARN_N_JOBS', '1')
+import numpy as np
+import matlab_ml_bridge as mb
+
+data = np.load({data_path!r})
+X, y = data['X'], data['y']
+seed = {seed}
+save_dir = {save_dir!r}
+model_key = {model_key!r}
+
+trainers = {{"cnn": mb.train_cnn, "transformer": mb.train_transformer, "rl": mb.train_rl}}
+predictors = {{"cnn": mb.predict_cnn, "transformer": mb.predict_transformer, "rl": mb.predict_rl}}
+
+model, info = trainers[model_key](X, y, seed=seed)
+result = {{"info": info}}
+if model is not None:
+    import torch
+    y_prob = predictors[model_key](model, X).tolist()
+    pt_path = os.path.join(save_dir, f"{{model_key}}_state.pt")
+    torch.save(model.state_dict(), pt_path)
+    result["y_prob"] = y_prob
+    result["pt_path"] = pt_path
+
+# Write result as JSON
+out_path = os.path.join(save_dir, f"_tmp_{{model_key}}_result.json")
+# Convert numpy types for JSON
+def jsonable(o):
+    if isinstance(o, dict): return {{str(k): jsonable(v) for k, v in o.items()}}
+    if isinstance(o, (list, tuple)): return [jsonable(v) for v in o]
+    if isinstance(o, (np.integer, np.floating)): return o.item()
+    return o
+with open(out_path, 'w') as f:
+    json.dump(jsonable(result), f)
+"""
+    print(f"[subprocess] Running {model_key} training via {_REAL_PYTHON} ...", flush=True)
+    proc = subprocess.run(
+        [_REAL_PYTHON, "-c", script],
+        capture_output=True, text=True, timeout=600,
+    )
+    # Forward stdout/stderr from subprocess
+    if proc.stdout:
+        for line in proc.stdout.rstrip().split("\n"):
+            print(line, flush=True)
+    if proc.returncode != 0:
+        print(f"[subprocess] {model_key} failed (exit {proc.returncode}):", flush=True)
+        if proc.stderr:
+            for line in proc.stderr.rstrip().split("\n"):
+                print(f"  {line}", flush=True)
+        return {"enabled": False, "reason": f"subprocess failed (exit {proc.returncode})"}, None
+
+    result_path = os.path.join(save_dir, f"_tmp_{model_key}_result.json")
+    with open(result_path) as f:
+        result = json.load(f)
+
+    # Clean up temp files
+    for tmp in [data_path, result_path]:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+    info = result["info"]
+    y_prob = result.get("y_prob")
+    return info, y_prob
+
+
 # ------------------------ GNN (optional) ------------------------
 
 if _HAS_TG:
@@ -717,30 +829,49 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
     # ---- Torch tabular models ----
     if "X" in parsed and torch_keys:
         X = parsed["X"]
-        torch_trainers = {
-            "cnn": (train_cnn, predict_cnn, TabularCNN if _HAS_TORCH else None),
-            "transformer": (train_transformer, predict_transformer, TabularTransformer if _HAS_TORCH else None),
-            "rl": (train_rl, predict_rl, DQNClassifier if _HAS_TORCH else None),
-        }
-        for tk in torch_keys:
-            train_fn, pred_fn, model_cls = torch_trainers[tk]
-            print(f"[bridge] Training {tk} model ...", flush=True)
-            model, info = train_fn(X, y, seed=seed)
-            if model is not None:
-                y_prob_torch = pred_fn(model, X)
-                pt_path = os.path.join(save_dir, f"{tk}_state.pt")
-                torch.save(model.state_dict(), pt_path)
-                print(f"[bridge] {tk} model saved: {pt_path}", flush=True)
-                results[tk] = {
-                    "enabled": True,
-                    "path": pt_path,
-                    "train_info": info,
-                    "metrics_select": info.get("val_metrics"),
-                    "metrics_train": _metrics(y, y_prob_torch),
-                    "y_prob": y_prob_torch.tolist(),
-                }
-            else:
-                results[tk] = info
+        if _HAS_TORCH:
+            # In-process path (normal Python, pytest, etc.)
+            torch_trainers = {
+                "cnn": (train_cnn, predict_cnn),
+                "transformer": (train_transformer, predict_transformer),
+                "rl": (train_rl, predict_rl),
+            }
+            for tk in torch_keys:
+                train_fn, pred_fn = torch_trainers[tk]
+                print(f"[bridge] Training {tk} model ...", flush=True)
+                model, info = train_fn(X, y, seed=seed)
+                if model is not None:
+                    y_prob_torch = pred_fn(model, X)
+                    pt_path = os.path.join(save_dir, f"{tk}_state.pt")
+                    torch.save(model.state_dict(), pt_path)
+                    print(f"[bridge] {tk} model saved: {pt_path}", flush=True)
+                    results[tk] = {
+                        "enabled": True,
+                        "path": pt_path,
+                        "train_info": info,
+                        "metrics_select": info.get("val_metrics"),
+                        "metrics_train": _metrics(y, y_prob_torch),
+                        "y_prob": y_prob_torch.tolist(),
+                    }
+                else:
+                    results[tk] = info
+        else:
+            # Subprocess fallback (MATLAB DLL conflict or torch not installed)
+            for tk in torch_keys:
+                print(f"[bridge] Training {tk} model (subprocess) ...", flush=True)
+                info, y_prob_list = _run_torch_subprocess(tk, X, y, seed, save_dir)
+                if y_prob_list is not None:
+                    y_prob_arr = np.array(y_prob_list, dtype=np.float32)
+                    results[tk] = {
+                        "enabled": True,
+                        "path": info.get("pt_path", os.path.join(save_dir, f"{tk}_state.pt")),
+                        "train_info": info,
+                        "metrics_select": info.get("val_metrics"),
+                        "metrics_train": _metrics(y, y_prob_arr),
+                        "y_prob": y_prob_list,
+                    }
+                else:
+                    results[tk] = info
 
     # ---- GNN model (graph per sample) ----
     if want_gnn and "node_feats" in parsed and "edge_index" in parsed:
@@ -779,7 +910,14 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
             cand.append((tk, results[tk]["metrics_select"]["f1"], results[tk]["y_prob"], results[tk]["metrics_select"]))
 
     if len(cand) == 0:
-        raise ValueError("No model could be trained. Provide X and/or (node_feats, edge_index) with valid binary y.")
+        # Build informative message listing disabled models
+        disabled = {k: v.get("reason", "unknown") for k, v in results.items()
+                    if isinstance(v, dict) and not v.get("enabled", True)}
+        msg = "No model could be trained."
+        if disabled:
+            msg += f" Disabled models: {disabled}."
+        msg += " Provide X and/or (node_feats, edge_index) with valid binary y."
+        raise ValueError(msg)
 
     cand.sort(key=lambda t: t[1], reverse=True)
     chosen, _, y_prob, chosen_metrics = cand[0]
