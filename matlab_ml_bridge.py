@@ -12,6 +12,10 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, HistGradientBoostingClassifier
 import joblib
 
+# n_jobs for GridSearchCV. Set env SKLEARN_N_JOBS=1 when calling from MATLAB
+# (MATLAB's embedded Python cannot spawn loky worker subprocesses).
+_N_JOBS = int(os.environ.get("SKLEARN_N_JOBS", "-1"))
+
 # --------- Optional GNN imports (fallback if not installed) ----------
 _HAS_TG = False
 torch = None
@@ -181,7 +185,7 @@ def train_best_tree_model(X, y, seed=0):
             param_grid=param_grids[name],
             scoring="f1",
             cv=cv,
-            n_jobs=-1,
+            n_jobs=_N_JOBS,
             refit=True,
         )
         gs.fit(X, y)

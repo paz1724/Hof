@@ -21,6 +21,10 @@ end
 configure_python(pythonExe);
 ensure_python_module_path(fileparts(mfilename("fullpath")));
 
+% Force single-process sklearn: MATLAB's embedded Python cannot spawn
+% loky worker subprocesses (TerminatedWorkerError with n_jobs=-1).
+pyrun("import os; os.environ['SKLEARN_N_JOBS'] = '1'");
+
 d = struct2pydict(sIn);
 bridge = py.importlib.import_module("matlab_ml_bridge");
 py.importlib.reload(bridge);
