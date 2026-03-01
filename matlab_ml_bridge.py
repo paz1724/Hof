@@ -356,13 +356,11 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
             X_va, y_va = X[va_idx], y[va_idx]
 
             name, tree, tree_cv = train_best_tree_model(X_tr, y_tr, seed=seed)
-            tree.fit(X_tr, y_tr)
             y_prob_val = _predict_proba_binary(tree, X_va)
             tree_select_metrics = _metrics(y_va, y_prob_val)
         else:
             # Small datasets may not support a stable stratified holdout split.
             name, tree, tree_cv = train_best_tree_model(X, y, seed=seed)
-            tree.fit(X, y)
             y_prob_val = _predict_proba_binary(tree, X)
             tree_select_metrics = _metrics(y, y_prob_val)
 

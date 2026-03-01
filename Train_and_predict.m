@@ -44,7 +44,7 @@ res_matlab.y_prob = y_prob;
 res_matlab.acc = acc;
 res_matlab.f1 = f1;
 res_matlab.auc = auc;
-res.matlab = res_matlab;
+res{"matlab"} = struct2pydict(res_matlab);
 end
 
 function configure_python(pythonExe)

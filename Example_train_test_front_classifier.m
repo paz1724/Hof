@@ -41,7 +41,7 @@ res = Train_and_predict(trainPayload, pythonExe, seed);
 chosen = string(res{"chosen"});
 
 % For this wrapper, we do explicit test inference with the saved tree model.
-if ~isKey(res, "tree")
+if ~logical(py.operator.contains(res, "tree"))
     error("Tree model result was not returned. This wrapper expects tabular tree training.");
 end
 treePath = string(res{"tree"}{"path"});
