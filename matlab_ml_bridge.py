@@ -111,7 +111,7 @@ def _parse_input(d: dict):
         print(f"[parse_input] X: {X.shape[0]} samples, {X.shape[1]} features", flush=True)
 
     # Optional: which models to train
-    _VALID_MODELS = {"rf", "et", "hgb", "svm", "cnn", "transformer", "rl", "gnn"}
+    _VALID_MODELS = {"random_forest", "extra_trees", "hist_gradient_boosting", "svm", "cnn", "transformer", "rl", "gnn"}
     if "models" in d:
         raw = d["models"]
         # A single string (e.g. from MATLAB scalar string) must not be
@@ -189,33 +189,33 @@ def train_sklearn_models(X, y, seed=0, model_keys=None):
     """
     Trains sklearn classifiers with CV and returns best estimator + cv results summary.
     *model_keys*: list of model name strings to evaluate.
-                  Default (None) → ``["rf", "et", "hgb"]`` (original behaviour).
+                  Default (None) → ``["random_forest", "extra_trees", "hist_gradient_boosting"]``.
     """
     if model_keys is None:
-        model_keys = ["rf", "et", "hgb"]
+        model_keys = ["random_forest", "extra_trees", "hist_gradient_boosting"]
 
     all_candidates = {
-        "rf": lambda: RandomForestClassifier(random_state=seed, class_weight="balanced"),
-        "et": lambda: ExtraTreesClassifier(random_state=seed, class_weight="balanced"),
-        "hgb": lambda: HistGradientBoostingClassifier(random_state=seed),
+        "random_forest": lambda: RandomForestClassifier(random_state=seed, class_weight="balanced"),
+        "extra_trees": lambda: ExtraTreesClassifier(random_state=seed, class_weight="balanced"),
+        "hist_gradient_boosting": lambda: HistGradientBoostingClassifier(random_state=seed),
         "svm": lambda: SVC(probability=True, class_weight="balanced", random_state=seed),
     }
 
     # Small but effective search spaces (edit as needed)
     all_param_grids = {
-        "rf": {
+        "random_forest": {
             "n_estimators": [200, 500],
             "max_depth": [None, 6, 12],
             "min_samples_leaf": [1, 3, 8],
             "max_features": ["sqrt", 0.8],
         },
-        "et": {
+        "extra_trees": {
             "n_estimators": [300, 700],
             "max_depth": [None, 6, 12],
             "min_samples_leaf": [1, 3, 8],
             "max_features": ["sqrt", 0.8],
         },
-        "hgb": {
+        "hist_gradient_boosting": {
             "max_depth": [3, 6, None],
             "learning_rate": [0.05, 0.1],
             "max_iter": [200, 400],
@@ -765,11 +765,11 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
 
     parsed = _parse_input(matlab_dict)
     y = parsed["y"]
-    models = parsed.get("models", ["rf", "et", "hgb"])  # default preserves old behaviour
+    models = parsed.get("models", ["random_forest", "extra_trees", "hist_gradient_boosting"])
 
     results = {}
 
-    _SKLEARN_KEYS = {"rf", "et", "hgb", "svm"}
+    _SKLEARN_KEYS = {"random_forest", "extra_trees", "hist_gradient_boosting", "svm"}
     _TORCH_TABULAR_KEYS = {"cnn", "transformer", "rl"}
 
     sklearn_keys = [m for m in models if m in _SKLEARN_KEYS]

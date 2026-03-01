@@ -19,9 +19,9 @@ pythonExe = "";  % use default Python
 seed = 0;
 
 % =====================================================================
-% 1. Default models (no models field) → rf, et, hgb
+% 1. Default models (no models field) → random_forest, extra_trees, hist_gradient_boosting
 % =====================================================================
-fprintf("\n===== TEST 1: Default models (rf, et, hgb) =====\n");
+fprintf("\n===== TEST 1: Default models (random_forest, extra_trees, hist_gradient_boosting) =====\n");
 sIn = struct('X', X, 'y', y);
 res = Train_and_predict(sIn, pythonExe, seed);
 chosen = string(res{"chosen"});
@@ -78,10 +78,10 @@ assert(logical(py.operator.contains(res5, "rl")), "Must have rl result");
 fprintf("  PASS\n");
 
 % =====================================================================
-% 6. Mixed: rf + svm + cnn
+% 6. Mixed: random_forest + svm + cnn
 % =====================================================================
-fprintf("\n===== TEST 6: Mixed (rf + svm + cnn) =====\n");
-sIn6 = struct('X', X, 'y', y, 'models', ["rf", "svm", "cnn"]);
+fprintf("\n===== TEST 6: Mixed (random_forest + svm + cnn) =====\n");
+sIn6 = struct('X', X, 'y', y, 'models', ["random_forest", "svm", "cnn"]);
 res6 = Train_and_predict(sIn6, pythonExe, seed);
 chosen6 = string(res6{"chosen"});
 fprintf("  chosen = %s\n", chosen6);
@@ -92,7 +92,7 @@ fprintf("  PASS\n");
 % 7. All tabular models together
 % =====================================================================
 fprintf("\n===== TEST 7: All tabular models =====\n");
-sIn7 = struct('X', X, 'y', y, 'models', ["rf", "et", "hgb", "svm", "cnn", "transformer", "rl"]);
+sIn7 = struct('X', X, 'y', y, 'models', ["random_forest", "extra_trees", "hist_gradient_boosting", "svm", "cnn", "transformer", "rl"]);
 res7 = Train_and_predict(sIn7, pythonExe, seed);
 chosen7 = string(res7{"chosen"});
 fprintf("  chosen = %s\n", chosen7);

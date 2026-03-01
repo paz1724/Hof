@@ -168,7 +168,7 @@ class TestTrainBestTreeModel:
 
     def test_returns_valid_name(self, trained):
         name, _, _ = trained
-        assert name in ("rf", "et", "hgb")
+        assert name in ("random_forest", "extra_trees", "hist_gradient_boosting")
 
     def test_model_can_predict(self, trained):
         _, model, _ = trained
@@ -320,23 +320,23 @@ class TestTrainGNNFallback:
 class TestModelSelection:
     def test_parse_input_models_field(self):
         d = _make_tabular(n=20, f=3)
-        d["models"] = ["rf", "svm"]
+        d["models"] = ["random_forest", "svm"]
         out = mb._parse_input(d)
-        assert out["models"] == ["rf", "svm"]
+        assert out["models"] == ["random_forest", "svm"]
 
     def test_parse_input_invalid_model_raises(self):
         d = _make_tabular(n=20, f=3)
-        d["models"] = ["rf", "bogus"]
+        d["models"] = ["random_forest", "bogus"]
         with pytest.raises(ValueError, match="Unknown model names"):
             mb._parse_input(d)
 
     def test_default_models_backward_compat(self, tmp_path):
-        """No models field → trains rf/et/hgb (old behaviour)."""
+        """No models field → trains random_forest/extra_trees/hist_gradient_boosting (old behaviour)."""
         d = _make_tabular(n=60, f=4, seed=99)
         save_dir = str(tmp_path / "compat")
         result = mb.train_predict_save(d, save_dir, seed=99)
         assert "tree" in result
-        assert result["tree"]["model"] in ("rf", "et", "hgb")
+        assert result["tree"]["model"] in ("random_forest", "extra_trees", "hist_gradient_boosting")
 
     def test_select_only_svm(self, tmp_path):
         d = _make_tabular(n=60, f=4, seed=99)
@@ -452,7 +452,7 @@ class TestMixedModels:
     def test_sklearn_plus_torch(self, tmp_path):
         """Train a mix of sklearn and torch models, check winner is selected."""
         d = _make_tabular(n=80, f=4, seed=42)
-        models = ["rf", "svm"]
+        models = ["random_forest", "svm"]
         if mb._HAS_TORCH:
             models.append("cnn")
         d["models"] = models

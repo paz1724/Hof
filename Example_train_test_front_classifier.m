@@ -37,12 +37,12 @@ trainPayload = struct();
 trainPayload.X = XTrain;
 trainPayload.y = yTrain;
 
-% Optional: select which models to train (default: ["rf","et","hgb"]).
-% Supported model keys: "rf", "et", "hgb", "svm", "cnn", "transformer", "rl", "gnn"
+% Optional: select which models to train (default: ["random_forest","extra_trees","hist_gradient_boosting"]).
+% Supported model keys: "random_forest", "extra_trees", "hist_gradient_boosting", "svm", "cnn", "transformer", "rl", "gnn"
 % Examples:
-%   trainPayload.models = ["rf", "svm"];             % sklearn only
-%   trainPayload.models = ["rf", "cnn", "transformer"]; % mix sklearn + torch
-%   trainPayload.models = ["rf", "et", "hgb", "svm", "cnn", "transformer", "rl"];  % all tabular
+%   trainPayload.models = ["random_forest", "svm"];             % sklearn only
+%   trainPayload.models = ["random_forest", "cnn", "transformer"]; % mix sklearn + torch
+%   trainPayload.models = ["random_forest", "extra_trees", "hist_gradient_boosting", "svm", "cnn", "transformer", "rl"];  % all tabular
 
 res = Train_and_predict(trainPayload, pythonExe, seed);
 chosen = string(res{"chosen"});
