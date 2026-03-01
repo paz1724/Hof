@@ -5,5 +5,8 @@
 __pycache__/
 *.pyc
 
+# Models
+py_models/
+
 # Claude
 .claude/
