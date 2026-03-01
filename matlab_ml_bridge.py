@@ -71,6 +71,8 @@ def _parse_input(d: dict):
         raise ValueError(f'Expected binary labels in "y" with values 0/1. Got {unique_y.tolist()}.')
 
     out = {"y": y}
+    counts = dict(zip(*np.unique(y, return_counts=True)))
+    print(f"[parse_input] y: {y.shape[0]} samples, class distribution: {counts}", flush=True)
 
     if "X" in d:
         X = _to_numpy(d["X"]).astype(np.float32)
@@ -79,6 +81,7 @@ def _parse_input(d: dict):
         if X.shape[0] != y.shape[0]:
             raise ValueError(f'X and y sample mismatch. X has {X.shape[0]} rows, y has {y.shape[0]}.')
         out["X"] = X
+        print(f"[parse_input] X: {X.shape[0]} samples, {X.shape[1]} features", flush=True)
 
     if "node_feats" in d and "edge_index" in d:
         node_feats = _to_numpy(d["node_feats"]).astype(np.float32)
@@ -102,6 +105,7 @@ def _parse_input(d: dict):
             raise ValueError(f"edge_index node ids must be in [0, {n_nodes - 1}].")
         out["node_feats"] = node_feats
         out["edge_index"] = edge_index
+        print(f"[parse_input] Graph data: {node_feats.shape[0]} graphs, {node_feats.shape[1]} nodes, {node_feats.shape[2]} features, {edge_index.shape[1]} edges", flush=True)
 
     return out
 
@@ -180,6 +184,7 @@ def train_best_tree_model(X, y, seed=0):
     best_cv = None
 
     for name, model in candidates:
+        print(f"[train_tree] Evaluating {name} ...", flush=True)
         gs = GridSearchCV(
             model,
             param_grid=param_grids[name],
@@ -189,6 +194,7 @@ def train_best_tree_model(X, y, seed=0):
             refit=True,
         )
         gs.fit(X, y)
+        print(f"[train_tree] {name} best CV f1={gs.best_score_:.4f}  params={gs.best_params_}", flush=True)
         if gs.best_score_ > best_score:
             best_score = float(gs.best_score_)
             best = gs.best_estimator_
@@ -198,6 +204,7 @@ def train_best_tree_model(X, y, seed=0):
                 "best_params": gs.best_params_,
             }
 
+    print(f"[train_tree] Winner: {best_name} (f1={best_score:.4f})", flush=True)
     return best_name, best, best_cv
 
 
@@ -249,12 +256,13 @@ def train_gnn(node_feats, edge_index, y, seed=0, epochs=80, lr=1e-3, batch_size=
     model = SimpleGCN(in_dim=Fdim, hidden=64)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = torch.nn.BCEWithLogitsLoss()
+    print(f"[train_gnn] Starting GNN training: {N} graphs, {V} nodes, {Fdim} features, {epochs} epochs", flush=True)
 
     best_val_f1 = -1.0
     best_val_metrics = None
     best_state = None
 
-    for _ in range(epochs):
+    for _epoch in range(epochs):
         model.train()
         for batch in train_loader:
             opt.zero_grad()
@@ -281,10 +289,13 @@ def train_gnn(node_feats, edge_index, y, seed=0, epochs=80, lr=1e-3, batch_size=
             best_val_f1 = m["f1"]
             best_val_metrics = m
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        if (_epoch + 1) % 10 == 0 or _epoch == 0:
+            print(f"[train_gnn] Epoch {_epoch+1}/{epochs}  val_f1={m['f1']:.4f}  best_f1={best_val_f1:.4f}", flush=True)
 
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    print(f"[train_gnn] Done. Best val metrics: {best_val_metrics}", flush=True)
     return model, {"enabled": True, "val_metrics": best_val_metrics}
 
 
@@ -308,6 +319,7 @@ def predict_gnn(model, node_feats, edge_index):
     with torch.no_grad():
         logits = model(x_all, ei_all, batch)
         probs = torch.sigmoid(logits).cpu().numpy().astype(np.float32)
+    print(f"[predict_gnn] Predicted {probs.shape[0]} graphs", flush=True)
     return probs
 
 
@@ -337,6 +349,7 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
       }
     """
     os.makedirs(save_dir, exist_ok=True)
+    print(f"[bridge] Parsing input ...", flush=True)
 
     parsed = _parse_input(matlab_dict)
     y = parsed["y"]
@@ -345,6 +358,7 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
 
     # ---- Tree model (tabular) ----
     if "X" in parsed:
+        print(f"[bridge] Training tree model ...", flush=True)
         X = parsed["X"]
         _, class_counts = np.unique(y, return_counts=True)
         can_holdout = class_counts.min() >= 2 and X.shape[0] >= 10
@@ -374,6 +388,7 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
 
         tree_path = os.path.join(save_dir, f"best_tree_{name}.joblib")
         joblib.dump(tree, tree_path)
+        print(f"[bridge] Tree model saved: {tree_path}", flush=True)
 
         results["tree"] = {
             "model": name,
@@ -386,6 +401,7 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
 
     # ---- GNN model (graph per sample) ----
     if "node_feats" in parsed and "edge_index" in parsed:
+        print(f"[bridge] Training GNN model ...", flush=True)
         if _HAS_TG:
             model, info = train_gnn(parsed["node_feats"], parsed["edge_index"], y, seed=seed)
             if model is not None:
@@ -431,10 +447,12 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
     results["chosen"] = chosen
     results["y_prob"] = y_prob
     results["metrics"] = chosen_metrics
+    print(f"[bridge] Chosen model: {chosen} | metrics: acc={chosen_metrics['acc']:.4f} f1={chosen_metrics['f1']:.4f} auc={chosen_metrics['auc']:.4f}", flush=True)
 
     # also save a small json summary
     with open(os.path.join(save_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(_to_jsonable(results), f, indent=2)
+    print(f"[bridge] Summary saved: {os.path.join(save_dir, 'summary.json')}", flush=True)
 
     return results
 
@@ -452,5 +470,7 @@ def predict_tree_model(model_path: str, X):
         raise ValueError(f"Expected X as [N,F] with F>=1. Got {X.shape}.")
 
     model = joblib.load(model_path)
+    print(f"[predict_tree] Loaded model from {model_path}", flush=True)
     y_prob = _predict_proba_binary(model, X)
+    print(f"[predict_tree] Predicted {y_prob.shape[0]} samples", flush=True)
     return {"y_prob": y_prob.tolist()}
