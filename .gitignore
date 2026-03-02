@@ -11,5 +11,9 @@ py_models/
 # Logs
 debug.log
 
+# Generated figures
+*.png
+*.fig
+
 # Claude
 .claude/

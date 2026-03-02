@@ -9,7 +9,8 @@ import numpy as np
 
 from sklearn.model_selection import StratifiedKFold, GridSearchCV, train_test_split
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, HistGradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, HistGradientBoostingClassifier, BaggingClassifier
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import SVC
 import joblib
 
@@ -111,7 +112,7 @@ def _parse_input(d: dict):
         print(f"[parse_input] X: {X.shape[0]} samples, {X.shape[1]} features", flush=True)
 
     # Optional: which models to train
-    _VALID_MODELS = {"random_forest", "extra_trees", "hist_gradient_boosting", "svm", "cnn", "transformer", "rl", "gnn"}
+    _VALID_MODELS = {"random_forest", "extra_trees", "hist_gradient_boosting", "bagged_trees", "svm", "cnn", "transformer", "rl", "gnn"}
     if "models" in d:
         raw = d["models"]
         # A single string (e.g. from MATLAB scalar string) must not be
@@ -198,6 +199,10 @@ def train_sklearn_models(X, y, seed=0, model_keys=None):
         "random_forest": lambda: RandomForestClassifier(random_state=seed, class_weight="balanced"),
         "extra_trees": lambda: ExtraTreesClassifier(random_state=seed, class_weight="balanced"),
         "hist_gradient_boosting": lambda: HistGradientBoostingClassifier(random_state=seed),
+        "bagged_trees": lambda: BaggingClassifier(
+            estimator=DecisionTreeClassifier(class_weight="balanced"),
+            random_state=seed,
+        ),
         "svm": lambda: SVC(probability=True, class_weight="balanced", random_state=seed),
     }
 
@@ -220,6 +225,11 @@ def train_sklearn_models(X, y, seed=0, model_keys=None):
             "learning_rate": [0.05, 0.1],
             "max_iter": [200, 400],
             "l2_regularization": [0.0, 0.1],
+        },
+        "bagged_trees": {
+            "n_estimators": [50, 200, 500],
+            "max_samples": [0.5, 0.8, 1.0],
+            "estimator__max_depth": [None, 6, 12],
         },
         "svm": {
             "C": [0.1, 1.0, 10.0],
@@ -312,19 +322,31 @@ def train_cnn(X, y, seed=0, epochs=80, lr=1e-3):
 
     best_f1, best_state = -1.0, None
     patience, wait = 15, 0
+    history = {"train_loss": [], "train_acc": [], "train_f1": [], "val_loss": [], "val_acc": [], "val_f1": []}
     print(f"[train_cnn] Starting CNN training: {X.shape[0]} samples, {X.shape[1]} features, {epochs} epochs", flush=True)
 
     for ep in range(epochs):
         model.train()
         opt.zero_grad()
-        loss = loss_fn(model(Xt), yt)
+        logits_tr = model(Xt)
+        loss = loss_fn(logits_tr, yt)
         loss.backward()
         opt.step()
+        history["train_loss"].append(float(loss.item()))
 
         model.eval()
         with torch.no_grad():
-            probs = torch.sigmoid(model(Xv)).numpy()
+            train_probs = torch.sigmoid(logits_tr.detach()).numpy()
+            logits_v = model(Xv)
+            val_loss = float(loss_fn(logits_v, yv).item())
+            probs = torch.sigmoid(logits_v).numpy()
+        train_m = _metrics(yt.numpy(), train_probs)
+        history["train_acc"].append(train_m["acc"])
+        history["train_f1"].append(train_m["f1"])
+        history["val_loss"].append(val_loss)
         m = _metrics(yv.numpy(), probs)
+        history["val_acc"].append(m["acc"])
+        history["val_f1"].append(m["f1"])
         if m["f1"] > best_f1:
             best_f1 = m["f1"]
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -341,7 +363,7 @@ def train_cnn(X, y, seed=0, epochs=80, lr=1e-3):
     if best_state is not None:
         model.load_state_dict(best_state)
     print(f"[train_cnn] Done. Best val metrics: {best_metrics}", flush=True)
-    return model, {"enabled": True, "val_metrics": best_metrics}
+    return model, {"enabled": True, "val_metrics": best_metrics, "epoch_history": history}
 
 
 def predict_cnn(model, X):
@@ -384,19 +406,31 @@ def train_transformer(X, y, seed=0, epochs=80, lr=1e-3):
 
     best_f1, best_state = -1.0, None
     patience, wait = 15, 0
+    history = {"train_loss": [], "train_acc": [], "train_f1": [], "val_loss": [], "val_acc": [], "val_f1": []}
     print(f"[train_transformer] Starting Transformer training: {X.shape[0]} samples, {X.shape[1]} features, {epochs} epochs", flush=True)
 
     for ep in range(epochs):
         model.train()
         opt.zero_grad()
-        loss = loss_fn(model(Xt), yt)
+        logits_tr = model(Xt)
+        loss = loss_fn(logits_tr, yt)
         loss.backward()
         opt.step()
+        history["train_loss"].append(float(loss.item()))
 
         model.eval()
         with torch.no_grad():
-            probs = torch.sigmoid(model(Xv)).numpy()
+            train_probs = torch.sigmoid(logits_tr.detach()).numpy()
+            logits_v = model(Xv)
+            val_loss = float(loss_fn(logits_v, yv).item())
+            probs = torch.sigmoid(logits_v).numpy()
+        train_m = _metrics(yt.numpy(), train_probs)
+        history["train_acc"].append(train_m["acc"])
+        history["train_f1"].append(train_m["f1"])
+        history["val_loss"].append(val_loss)
         m = _metrics(yv.numpy(), probs)
+        history["val_acc"].append(m["acc"])
+        history["val_f1"].append(m["f1"])
         if m["f1"] > best_f1:
             best_f1 = m["f1"]
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -413,7 +447,7 @@ def train_transformer(X, y, seed=0, epochs=80, lr=1e-3):
     if best_state is not None:
         model.load_state_dict(best_state)
     print(f"[train_transformer] Done. Best val metrics: {best_metrics}", flush=True)
-    return model, {"enabled": True, "val_metrics": best_metrics}
+    return model, {"enabled": True, "val_metrics": best_metrics, "epoch_history": history}
 
 
 def predict_transformer(model, X):
@@ -471,10 +505,13 @@ def train_rl(X, y, seed=0, episodes=5, lr=1e-3):
 
     best_f1, best_state, best_metrics = -1.0, None, None
     step = 0
+    history = {"train_loss": [], "train_acc": [], "train_f1": [], "val_loss": [], "val_acc": [], "val_f1": []}
     print(f"[train_rl] Starting RL DQN training: {X.shape[0]} samples, {episodes} episodes", flush=True)
 
     for ep in range(episodes):
         order = rng.permutation(len(X_tr))
+        ep_loss = 0.0
+        ep_loss_count = 0
         for i in order:
             state = torch.tensor(X_tr[i], dtype=torch.float32).unsqueeze(0)
             eps = eps_start - (eps_start - eps_end) * min(step / max(total_steps - 1, 1), 1.0)
@@ -507,13 +544,31 @@ def train_rl(X, y, seed=0, episodes=5, lr=1e-3):
                 loss = loss_fn(q_selected, br)
                 loss.backward()
                 opt.step()
+                ep_loss += float(loss.item())
+                ep_loss_count += 1
+
+        avg_train_loss = ep_loss / max(ep_loss_count, 1)
+        history["train_loss"].append(avg_train_loss)
 
         # Validation after each episode
         model.eval()
         with torch.no_grad():
-            q = model(torch.tensor(X_va, dtype=torch.float32))
-            probs = torch.softmax(q, dim=1)[:, 1].numpy()
+            q_tr = model(torch.tensor(X_tr, dtype=torch.float32))
+            q_va = model(torch.tensor(X_va, dtype=torch.float32))
+            # Training accuracy
+            train_probs = torch.softmax(q_tr, dim=1)[:, 1].numpy()
+            # Use MSE between Q-selected and ideal reward as val_loss proxy
+            ideal_rewards = torch.tensor(y_va * 2.0 - 1.0, dtype=torch.float32)  # +1/-1
+            q_va_selected = q_va.gather(1, torch.tensor(y_va, dtype=torch.long).unsqueeze(1)).squeeze(1)
+            val_loss = float(loss_fn(q_va_selected, ideal_rewards).item())
+            probs = torch.softmax(q_va, dim=1)[:, 1].numpy()
+        train_m = _metrics(y_tr, train_probs)
+        history["train_acc"].append(train_m["acc"])
+        history["train_f1"].append(train_m["f1"])
+        history["val_loss"].append(val_loss)
         m = _metrics(y_va, probs)
+        history["val_acc"].append(m["acc"])
+        history["val_f1"].append(m["f1"])
         if m["f1"] > best_f1:
             best_f1 = m["f1"]
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -523,7 +578,7 @@ def train_rl(X, y, seed=0, episodes=5, lr=1e-3):
     if best_state is not None:
         model.load_state_dict(best_state)
     print(f"[train_rl] Done. Best val metrics: {best_metrics}", flush=True)
-    return model, {"enabled": True, "val_metrics": best_metrics}
+    return model, {"enabled": True, "val_metrics": best_metrics, "epoch_history": history}
 
 
 def predict_rl(model, X):
@@ -769,7 +824,7 @@ def train_predict_save(matlab_dict: dict, save_dir: str, seed: int = 0):
 
     results = {}
 
-    _SKLEARN_KEYS = {"random_forest", "extra_trees", "hist_gradient_boosting", "svm"}
+    _SKLEARN_KEYS = {"random_forest", "extra_trees", "hist_gradient_boosting", "bagged_trees", "svm"}
     _TORCH_TABULAR_KEYS = {"cnn", "transformer", "rl"}
 
     sklearn_keys = [m for m in models if m in _SKLEARN_KEYS]

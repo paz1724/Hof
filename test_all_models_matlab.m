@@ -78,34 +78,48 @@ assert(logical(py.operator.contains(res5, "rl")), "Must have rl result");
 fprintf("  PASS\n");
 
 % =====================================================================
-% 6. Mixed: random_forest + svm + cnn
+% 6. Bagged Trees only
 % =====================================================================
-fprintf("\n===== TEST 6: Mixed (random_forest + svm + cnn) =====\n");
-sIn6 = struct('X', X, 'y', y, 'models', ["random_forest", "svm", "cnn"]);
+fprintf("\n===== TEST 6: Bagged Trees only =====\n");
+sIn6 = struct('X', X, 'y', y, 'models', ["bagged_trees"]);
 res6 = Train_and_predict(sIn6, pythonExe, seed);
 chosen6 = string(res6{"chosen"});
 fprintf("  chosen = %s\n", chosen6);
-assert(chosen6 ~= "", "chosen must be non-empty");
+assert(logical(py.operator.contains(res6, "tree")), "Must have tree result for bagged_trees");
+model_name6 = string(res6{"tree"}{"model"});
+fprintf("  tree.model = %s\n", model_name6);
+assert(model_name6 == "bagged_trees", "Model name must be bagged_trees");
 fprintf("  PASS\n");
 
 % =====================================================================
-% 7. All tabular models together
+% 7. Mixed: random_forest + svm + cnn
 % =====================================================================
-fprintf("\n===== TEST 7: All tabular models =====\n");
-sIn7 = struct('X', X, 'y', y, 'models', ["random_forest", "extra_trees", "hist_gradient_boosting", "svm", "cnn", "transformer", "rl"]);
+fprintf("\n===== TEST 7: Mixed (random_forest + svm + cnn) =====\n");
+sIn7 = struct('X', X, 'y', y, 'models', ["random_forest", "svm", "cnn"]);
 res7 = Train_and_predict(sIn7, pythonExe, seed);
 chosen7 = string(res7{"chosen"});
 fprintf("  chosen = %s\n", chosen7);
-y_prob = py_to_double_vector(res7{"y_prob"});
+assert(chosen7 ~= "", "chosen must be non-empty");
+fprintf("  PASS\n");
+
+% =====================================================================
+% 8. All tabular models together
+% =====================================================================
+fprintf("\n===== TEST 8: All tabular models =====\n");
+sIn8 = struct('X', X, 'y', y, 'models', ["random_forest", "extra_trees", "hist_gradient_boosting", "bagged_trees", "svm", "cnn", "transformer", "rl"]);
+res8 = Train_and_predict(sIn8, pythonExe, seed);
+chosen8 = string(res8{"chosen"});
+fprintf("  chosen = %s\n", chosen8);
+y_prob = py_to_double_vector(res8{"y_prob"});
 fprintf("  y_prob length = %d (expected %d)\n", numel(y_prob), N);
 assert(numel(y_prob) == N, "y_prob length must match N");
-acc = double(res7{"metrics"}{"acc"});
-f1  = double(res7{"metrics"}{"f1"});
+acc = double(res8{"metrics"}{"acc"});
+f1  = double(res8{"metrics"}{"f1"});
 fprintf("  acc=%.3f  f1=%.3f\n", acc, f1);
 fprintf("  PASS\n");
 
 % =====================================================================
-fprintf("\n===== ALL %d TESTS PASSED =====\n", 7);
+fprintf("\n===== ALL %d TESTS PASSED =====\n", 8);
 end
 
 function x = py_to_double_vector(pyObj)

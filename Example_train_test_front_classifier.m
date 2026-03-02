@@ -38,7 +38,7 @@ trainPayload.X = XTrain;
 trainPayload.y = yTrain;
 
 % Optional: select which models to train (default: ["random_forest","extra_trees","hist_gradient_boosting"]).
-% Supported model keys: "random_forest", "extra_trees", "hist_gradient_boosting", "svm", "cnn", "transformer", "rl", "gnn"
+% Supported model keys: "random_forest", "extra_trees", "hist_gradient_boosting", "bagged_trees", "svm", "cnn", "transformer", "rl", "gnn"
 % Examples:
 %   trainPayload.models = ["random_forest", "svm"];             % sklearn only
 %   trainPayload.models = ["random_forest", "cnn", "transformer"]; % mix sklearn + torch
